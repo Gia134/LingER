@@ -1,36 +1,67 @@
-name: Windows 2022
+name: RDP via Tailscale
 
-on: workflow_dispatch
+on:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: windows-2022
-    timeout-minutes: 9999
+  secure-rdp:
+    # This must run on a Windows runner
+    runs-on: windows-latest
+    # Optional: set a timeout to prevent runners from running indefinitely
+    timeout-minutes: 3600
 
     steps:
-    - name: Making the Core
-      run: |
-        Invoke-WebRequest https://storage.curvee.eu.org/ngrok-windows-amd64-v3.zip -OutFile ngrok.zip
-        Invoke-WebRequest https://storage.curvee.eu.org/start-2022.bat -OutFile start.bat
-        Invoke-WebRequest https://storage.curvee.eu.org/wallpaper.png -OutFile wallpaper.png
-        Invoke-WebRequest https://storage.curvee.eu.org/wallpaper.bat -OutFile wallpaper.bat
-        Invoke-WebRequest https://storage.curvee.eu.org/loop.bat -OutFile loop.bat
-    - name: Extracting Ngrok File
-      run: Expand-Archive ngrok.zip
-    - name: Connect to Ngrok.
-      run: .\ngrok\ngrok.exe authtoken $Env:NGROK_AUTH_TOKEN
-      env:
-        NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
-    - name: Enabling access to RDP
-      run: | 
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server'-name "fDenyTSConnections" -Value 0
-        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 1
-        copy wallpaper.png C:\Users\Public\Desktop\wallpaper.png
-        copy wallpaper.bat C:\Users\Public\Desktop\wallpaper.bat
-    - name: Open Tunnel.
-      run: Start-Process Powershell -ArgumentList '-Noexit -Command ".\ngrok\ngrok.exe tcp --region ap 3389"'
-    - name: Connect to your RDP
-      run: cmd /c start.bat
-    - name: Successfully made! You can close the tab now.
-      run: cmd /c loop.bat
+      - name: Install Tailscale
+        # You may need to use a specific URL based on the latest version
+        shell: powershell
+        run: |
+          $installerPath = "C:\temp\tailscale-setup.msi"
+          # Download the latest stable Tailscale MSI installer
+          Invoke-WebRequest -Uri pkgs.tailscale.com -OutFile $installerPath
+          msiexec /i $installerPath /qn /norestart | Write-Host
+          # Start the Tailscale service
+          Start-Service -Name Tailscale
+      
+      - name: Establish Tailscale Connection
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci-rdp
+          # Optional: Use ephemeral nodes that clean up automatically
+          ephemeral: true
+
+      - name: Configure Windows RDP & Firewall
+        shell: powershell
+        run: |
+          # Enable RDP on the system
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -value 0
+          # Allow RDP traffic through the Windows Firewall for the Tailscale IP range (100.64.0.0/10)
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
+          # Restart the Remote Desktop Service to apply changes
+          Restart-Service -Name TermService -Force
+      
+      - name: Create RDP User with Fixed Password
+        shell: powershell
+        env:
+          RDP_USER_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          # Note: The password will be masked in GitHub logs if added as a secret
+          $securePass = ConvertTo-SecureString $env:RDP_USER_PASSWORD -AsPlainText -Force
+          # Create a new local user and add them to the "Remote Desktop Users" group
+          New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
+          # Get the Tailscale IP and store it as a workflow environment variable
+          $tsIP = (tailscale ip -4)
+          Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
+
+      - name: Print Connection Details
+        run: |
+          echo "RDP into the runner using IP: ${{ env.TAILSCALE_IP }}"
+          echo "Username: RDPUser"
+          echo "Password: The secret RDP_PASSWORD you configured"
+          echo "This workflow will run for 60 minutes or until manually canceled."
+          # Keep the workflow alive so you can connect
+          Start-Sleep -Seconds 3600 # Sleeps for an hour
+          
